@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   poll:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     timeout-minutes: 4 # hard ceiling — cron is 5min apart, never exceed that
     steps:
       - name: Check out
