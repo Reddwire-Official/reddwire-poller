@@ -16,7 +16,10 @@ concurrency:
 
 jobs:
   poll:
-    runs-on: macos-latest
+    # NOTE: Reddit cycles through blocking different cloud IP ranges. macOS
+    # runners worked in May 2026 but got blocked. If ubuntu starts 403ing too,
+    # the next move is Reddit OAuth (see README).
+    runs-on: ubuntu-latest
     timeout-minutes: 6 # 4 min work budget + up to 2 min sleep before dispatch
     steps:
       - name: Check out
