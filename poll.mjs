@@ -98,20 +98,30 @@ async function main() {
 
 	if (monitors.length === 0) return;
 
-	const results = [];
-	for (const monitor of monitors) {
+	// Dedup by subreddit: if 8 monitors watch r/news, fetch r/news ONCE and
+	// distribute the same posts to all 8 results. Eliminates rapid identical
+	// requests that trigger Reddit's bot detection, AND cuts our Reddit
+	// request count drastically.
+	const uniqueSubs = [...new Set(monitors.map((m) => m.subreddit))];
+	console.log(`  Unique subreddits: ${uniqueSubs.length}`);
+	const fetchCache = {};
+	for (const sub of uniqueSubs) {
 		try {
-			const posts = await fetchSubreddit(monitor.subreddit);
-			results.push({ monitor_id: monitor.id, posts });
-			console.log(`  ✓ r/${monitor.subreddit}: ${posts.length} posts`);
+			fetchCache[sub] = { posts: await fetchSubreddit(sub) };
+			console.log(`  ✓ r/${sub}: ${fetchCache[sub].posts.length} posts`);
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
-			results.push({ monitor_id: monitor.id, error: message });
-			console.error(`  ✗ r/${monitor.subreddit}: ${message}`);
+			fetchCache[sub] = { error: message };
+			console.error(`  ✗ r/${sub}: ${message}`);
 		}
-		// Be polite to Reddit, even though we're well under the rate limit.
 		await sleep(INTER_REQUEST_DELAY_MS);
 	}
+
+	const results = monitors.map((m) => {
+		const cached = fetchCache[m.subreddit];
+		if (cached.error) return { monitor_id: m.id, error: cached.error };
+		return { monitor_id: m.id, posts: cached.posts };
+	});
 
 	const summary = await authJson(`${API}/api/internal/poll-result`, {
 		method: 'POST',
