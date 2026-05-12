@@ -22,9 +22,17 @@ import { setTimeout as sleep } from 'node:timers/promises';
 
 const API = process.env.REDDWIRE_API_URL || 'https://api.reddwire.dev';
 const SECRET = process.env.REDDWIRE_INTERNAL_SECRET;
-const USER_AGENT = 'Reddwire/0.1.0 (+https://reddwire.dev)';
+// Browser-like UA — Reddit's anti-scraping aggressively blocks "bot-shaped"
+// User-Agent strings on top of datacenter IP filtering.
+const USER_AGENT =
+	'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36';
 const REDDIT_FETCH_LIMIT = 25;
 const INTER_REQUEST_DELAY_MS = 500;
+
+// Endpoints to try in order. old.reddit.com sometimes serves requests that
+// www.reddit.com 403s because legacy clients still target it and Reddit
+// can't break them without breaking their own old UI.
+const REDDIT_HOSTS = ['www.reddit.com', 'old.reddit.com'];
 
 if (!SECRET) {
 	console.error('REDDWIRE_INTERNAL_SECRET env var is required');
@@ -52,16 +60,30 @@ async function fetchSubreddit(subreddit) {
 		.trim()
 		.replace(/^\/?r\//i, '')
 		.replace(/^\/+|\/+$/g, '');
-	const url = `https://www.reddit.com/r/${encodeURIComponent(clean)}/new.json?limit=${REDDIT_FETCH_LIMIT}`;
-	const response = await fetch(url, { headers: { 'User-Agent': USER_AGENT } });
-	if (!response.ok) {
-		throw new Error(`Reddit returned ${response.status} for r/${clean}`);
+
+	const headers = {
+		'User-Agent': USER_AGENT,
+		Accept: 'application/json, text/javascript, */*; q=0.01',
+		'Accept-Language': 'en-US,en;q=0.9',
+	};
+
+	let lastError;
+	for (const host of REDDIT_HOSTS) {
+		const url = `https://${host}/r/${encodeURIComponent(clean)}/new.json?limit=${REDDIT_FETCH_LIMIT}&raw_json=1`;
+		try {
+			const response = await fetch(url, { headers });
+			if (!response.ok) {
+				lastError = new Error(`${host} → ${response.status}`);
+				continue;
+			}
+			const data = await response.json();
+			const children = data?.data?.children ?? [];
+			return children.map((c) => c?.data).filter((p) => p && typeof p.id === 'string');
+		} catch (err) {
+			lastError = err instanceof Error ? err : new Error(String(err));
+		}
 	}
-	const data = await response.json();
-	const children = data?.data?.children ?? [];
-	return children
-		.map((c) => c?.data)
-		.filter((p) => p && typeof p.id === 'string');
+	throw new Error(`All hosts failed for r/${clean}: ${lastError?.message ?? 'unknown'}`);
 }
 
 async function main() {
