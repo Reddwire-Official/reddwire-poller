@@ -1,0 +1,24 @@
+{
+	"name": "reddwire-poller",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"description": "Public polling engine for Reddwire's hosted SaaS. Runs as a GitHub Actions cron every 5 minutes.",
+	"main": "poll.mjs",
+	"scripts": {
+		"poll": "node poll.mjs"
+	},
+	"engines": {
+		"node": ">=20.0.0"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/Reddwire-Official/reddwire-poller.git"
+	},
+	"license": "SEE LICENSE IN LICENSE",
+	"author": {
+		"name": "Reddwire",
+		"email": "info@reddwire.dev",
+		"url": "https://reddwire.dev"
+	}
+}

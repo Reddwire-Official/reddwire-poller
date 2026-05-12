@@ -1,0 +1,31 @@
+name: Reddwire Poller
+
+on:
+  schedule:
+    # Every 5 minutes — GitHub Actions cron minimum granularity.
+    - cron: '*/5 * * * *'
+  workflow_dispatch: # manual trigger for testing
+
+# Prevent overlapping runs; let the previous one finish before starting next.
+concurrency:
+  group: reddwire-poll
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4 # hard ceiling — cron is 5min apart, never exceed that
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Poll Reddit and forward to Worker
+        env:
+          REDDWIRE_INTERNAL_SECRET: ${{ secrets.REDDWIRE_INTERNAL_SECRET }}
+          REDDWIRE_API_URL: https://api.reddwire.dev
+        run: node poll.mjs
