@@ -1,41 +1,45 @@
 /**
  * Reddwire polling agent — runs as a GitHub Actions cron.
  *
- * Why this exists: Cloudflare Workers can't fetch reddit.com/.json from the
- * Cloudflare edge — Reddit blanket-blocks Cloudflare's datacenter IPs with a
- * 403. GitHub Actions runners use Azure IPs that Reddit accepts (millions of
- * legitimate workflows hit Reddit from GitHub every day; blocking them would
- * break too much of the open-source ecosystem).
+ * Why this exists: Cloudflare Workers can't fetch reddit.com from the CF edge
+ * (CF IPs blanket-blocked). GitHub Actions IPs USED to work but Reddit ramped
+ * up bot detection through 2026 — anonymous requests from cloud IPs now 403
+ * on both www.reddit.com and old.reddit.com. The durable fix is OAuth, which
+ * Reddit's rate limit is generous on (60 req/min, 600 req/10min).
+ *
+ * Auth modes (in order of preference):
+ *   1. OAuth (script app, password grant) — preferred. Requires
+ *      REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USERNAME, REDDIT_PASSWORD.
+ *      Reddit returns Bearer tokens valid for ~1 hour. We cache in-memory
+ *      across the per-monitor loop within a single workflow run.
+ *   2. Anonymous — fallback if no OAuth creds set. Works locally; usually
+ *      403s from GitHub Actions runners. Last-resort only.
  *
  * Flow per tick:
  *   1. GET  api.reddwire.dev/api/internal/poll-queue   → due monitors
- *   2. For each: fetch reddit.com/r/{sub}/new.json
- *   3. POST api.reddwire.dev/api/internal/poll-result  → batched raw posts
- *      The Worker handles dedup, keyword filtering, and webhook delivery.
- *
- * No user data (emails, webhook URLs, keywords) is ever exposed to this
- * runtime. Public repo, no leakage. Authentication via REDDWIRE_INTERNAL_SECRET
- * (GitHub Actions secret matching the Worker's wrangler secret).
+ *   2. Dedup subreddits (8 monitors on r/news = 1 Reddit call, not 8)
+ *   3. Fetch each unique subreddit's /new feed
+ *   4. POST api.reddwire.dev/api/internal/poll-result  → batched raw posts
  */
 
 import { setTimeout as sleep } from 'node:timers/promises';
 
 const API = process.env.REDDWIRE_API_URL || 'https://api.reddwire.dev';
 const SECRET = process.env.REDDWIRE_INTERNAL_SECRET;
-// Browser-like UA — Reddit's anti-scraping aggressively blocks "bot-shaped"
-// User-Agent strings on top of datacenter IP filtering.
-// Mozilla UA — Firefox usually triggers less aggressive bot-detection than
-// Chrome strings, since botnets default to Chrome.
-const USER_AGENT =
-	'Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0';
+
+const REDDIT_CLIENT_ID = process.env.REDDIT_CLIENT_ID;
+const REDDIT_CLIENT_SECRET = process.env.REDDIT_CLIENT_SECRET;
+const REDDIT_USERNAME = process.env.REDDIT_USERNAME;
+const REDDIT_PASSWORD = process.env.REDDIT_PASSWORD;
+const HAS_OAUTH =
+	!!REDDIT_CLIENT_ID && !!REDDIT_CLIENT_SECRET && !!REDDIT_USERNAME && !!REDDIT_PASSWORD;
+
+// Reddit's docs require a unique, descriptive UA that identifies who you
+// are and how to reach you. Required for OAuth, recommended for anonymous.
+const USER_AGENT = 'web:reddwire-poller:0.2.0 (by /u/reddwire)';
 const REDDIT_FETCH_LIMIT = 25;
 const INTER_REQUEST_DELAY_MS = 500;
-
-// Endpoints to try in order. Each has independent anti-bot logic and
-// different IP block lists, so multi-host fallback recovers from per-host
-// outages. If all three 403, the issue is the runner IP range — switch
-// to Reddit OAuth (see README) or change `runs-on:` in the workflow.
-const REDDIT_HOSTS = ['www.reddit.com', 'old.reddit.com', 'reddit.com'];
+const ANON_REDDIT_HOSTS = ['www.reddit.com', 'old.reddit.com', 'reddit.com'];
 
 if (!SECRET) {
 	console.error('REDDWIRE_INTERNAL_SECRET env var is required');
@@ -43,6 +47,8 @@ if (!SECRET) {
 }
 
 const ts = () => new Date().toISOString();
+
+// ─── Reddwire Worker API (Bearer INTERNAL_SECRET) ────────────────────────
 
 async function authJson(url, init = {}) {
 	const headers = {
@@ -58,23 +64,73 @@ async function authJson(url, init = {}) {
 	return text ? JSON.parse(text) : null;
 }
 
-async function fetchSubreddit(subreddit) {
-	const clean = subreddit
-		.trim()
-		.replace(/^\/?r\//i, '')
-		.replace(/^\/+|\/+$/g, '');
+// ─── Reddit OAuth ────────────────────────────────────────────────────────
 
-	const headers = {
-		'User-Agent': USER_AGENT,
-		Accept: 'application/json, text/javascript, */*; q=0.01',
-		'Accept-Language': 'en-US,en;q=0.9',
-	};
+let cachedOauthToken = null;
+let cachedOauthExpiresAt = 0;
 
+async function getRedditOauthToken() {
+	if (cachedOauthToken && Date.now() < cachedOauthExpiresAt - 60_000) {
+		return cachedOauthToken;
+	}
+	const basic = Buffer.from(`${REDDIT_CLIENT_ID}:${REDDIT_CLIENT_SECRET}`).toString('base64');
+	const response = await fetch('https://www.reddit.com/api/v1/access_token', {
+		method: 'POST',
+		headers: {
+			Authorization: `Basic ${basic}`,
+			'Content-Type': 'application/x-www-form-urlencoded',
+			'User-Agent': USER_AGENT,
+		},
+		body: new URLSearchParams({
+			grant_type: 'password',
+			username: REDDIT_USERNAME,
+			password: REDDIT_PASSWORD,
+		}),
+	});
+	const text = await response.text();
+	if (!response.ok) {
+		throw new Error(`Reddit OAuth → ${response.status}: ${text.slice(0, 200)}`);
+	}
+	const data = JSON.parse(text);
+	if (!data.access_token) throw new Error(`Reddit OAuth: no token in response`);
+	cachedOauthToken = data.access_token;
+	// expires_in is seconds; default ~3600. Subtract 60s grace.
+	cachedOauthExpiresAt = Date.now() + (data.expires_in ?? 3600) * 1000;
+	return cachedOauthToken;
+}
+
+// ─── Subreddit fetchers ──────────────────────────────────────────────────
+
+async function fetchSubredditOauth(subreddit) {
+	const token = await getRedditOauthToken();
+	const url = `https://oauth.reddit.com/r/${encodeURIComponent(subreddit)}/new?limit=${REDDIT_FETCH_LIMIT}&raw_json=1`;
+	const response = await fetch(url, {
+		headers: {
+			Authorization: `Bearer ${token}`,
+			'User-Agent': USER_AGENT,
+		},
+	});
+	if (!response.ok) {
+		const text = await response.text();
+		throw new Error(`oauth.reddit.com → ${response.status}: ${text.slice(0, 120)}`);
+	}
+	const data = await response.json();
+	const children = data?.data?.children ?? [];
+	return children.map((c) => c?.data).filter((p) => p && typeof p.id === 'string');
+}
+
+async function fetchSubredditAnonymous(subreddit) {
 	let lastError;
-	for (const host of REDDIT_HOSTS) {
-		const url = `https://${host}/r/${encodeURIComponent(clean)}/new.json?limit=${REDDIT_FETCH_LIMIT}&raw_json=1`;
+	for (const host of ANON_REDDIT_HOSTS) {
+		const url = `https://${host}/r/${encodeURIComponent(subreddit)}/new.json?limit=${REDDIT_FETCH_LIMIT}&raw_json=1`;
 		try {
-			const response = await fetch(url, { headers });
+			const response = await fetch(url, {
+				headers: {
+					'User-Agent': USER_AGENT,
+					Accept: 'application/json, text/javascript, */*; q=0.01',
+					'Accept-Language': 'en-US,en;q=0.9',
+				},
+			});
 			if (!response.ok) {
 				lastError = new Error(`${host} → ${response.status}`);
 				continue;
@@ -86,11 +142,21 @@ async function fetchSubreddit(subreddit) {
 			lastError = err instanceof Error ? err : new Error(String(err));
 		}
 	}
-	throw new Error(`All hosts failed for r/${clean}: ${lastError?.message ?? 'unknown'}`);
+	throw new Error(`All hosts failed for r/${subreddit}: ${lastError?.message ?? 'unknown'}`);
 }
 
+async function fetchSubreddit(subreddit) {
+	const clean = subreddit
+		.trim()
+		.replace(/^\/?r\//i, '')
+		.replace(/^\/+|\/+$/g, '');
+	return HAS_OAUTH ? fetchSubredditOauth(clean) : fetchSubredditAnonymous(clean);
+}
+
+// ─── Main ────────────────────────────────────────────────────────────────
+
 async function main() {
-	console.log(`[${ts()}] Reddwire poll tick`);
+	console.log(`[${ts()}] Reddwire poll tick — auth: ${HAS_OAUTH ? 'OAuth' : 'anonymous'}`);
 
 	const queue = await authJson(`${API}/api/internal/poll-queue`);
 	const monitors = Array.isArray(queue?.monitors) ? queue.monitors : [];
@@ -98,10 +164,8 @@ async function main() {
 
 	if (monitors.length === 0) return;
 
-	// Dedup by subreddit: if 8 monitors watch r/news, fetch r/news ONCE and
-	// distribute the same posts to all 8 results. Eliminates rapid identical
-	// requests that trigger Reddit's bot detection, AND cuts our Reddit
-	// request count drastically.
+	// Dedup by subreddit: many monitors may watch the same subreddit. Fetch
+	// each once and distribute. Cuts request count + reduces 403 risk.
 	const uniqueSubs = [...new Set(monitors.map((m) => m.subreddit))];
 	console.log(`  Unique subreddits: ${uniqueSubs.length}`);
 	const fetchCache = {};
