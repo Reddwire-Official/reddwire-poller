@@ -60,15 +60,24 @@ jobs:
           GH_TOKEN: ${{ secrets.SELF_DISPATCH_TOKEN }}
         run: |
           if [ -z "$GH_TOKEN" ]; then
-            echo "SELF_DISPATCH_TOKEN not set — chain will not continue."
-            echo "Set this secret to enable real 5-min cadence; otherwise"
-            echo "we fall back to the 30-min schedule (3x slower)."
+            echo "::warning::SELF_DISPATCH_TOKEN not set — falling back to */30 schedule."
             exit 0
           fi
-          curl -sS -X POST \
+          # Use -w to capture HTTP status — curl exits 0 on 4xx/5xx by default,
+          # which silently broke the chain (logged "dispatched" while GitHub
+          # returned 403). Surface the real status now.
+          RESPONSE=$(curl -sS -w "\n%{http_code}" -X POST \
             -H "Authorization: token $GH_TOKEN" \
             -H "Accept: application/vnd.github.v3+json" \
             "https://api.github.com/repos/${{ github.repository }}/actions/workflows/poll.yml/dispatches" \
-            -d '{"ref":"main"}' \
-            && echo "Next run dispatched." \
-            || echo "Self-dispatch failed; */30 cron will recover."
+            -d '{"ref":"main"}')
+          STATUS=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+          if [ "$STATUS" -ge 200 ] && [ "$STATUS" -lt 300 ]; then
+            echo "Next run dispatched (HTTP $STATUS)."
+          else
+            echo "::error::Self-dispatch failed: HTTP $STATUS"
+            echo "$BODY"
+            echo "Token likely lacks 'actions:write' on this repo. Check secret."
+            # Don't exit 1 — let */30 cron recover.
+          fi
