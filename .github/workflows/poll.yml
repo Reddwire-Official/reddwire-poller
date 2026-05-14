@@ -30,18 +30,11 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Poll Reddit and forward to Worker
+      - name: Poll Reddit (RSS) and forward to Worker
         id: poll
         env:
           REDDWIRE_INTERNAL_SECRET: ${{ secrets.REDDWIRE_INTERNAL_SECRET }}
           REDDWIRE_API_URL: https://api.reddwire.dev
-          # Reddit OAuth (script-app password grant) — required for production
-          # because anonymous Reddit access from GitHub IPs hard-403s.
-          # Create app: https://www.reddit.com/prefs/apps
-          REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
-          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
-          REDDIT_USERNAME: ${{ secrets.REDDIT_USERNAME }}
-          REDDIT_PASSWORD: ${{ secrets.REDDIT_PASSWORD }}
         run: node poll.mjs
 
       # Self-dispatching chain — bypasses GitHub free-tier cron throttling.
