@@ -182,6 +182,147 @@ function parseRedditAtom(xml, fallbackSubreddit) {
 
 // ─── Subreddit fetcher ───────────────────────────────────────────────────
 
+// ─── Bluesky (public Atom feed per user) ─────────────────────────────────
+
+async function fetchBluesky(query) {
+	// bsky:<handle> → that user's posts. bsky:tag:<tag> → tag search.
+	const after = query.replace(/^bsky:/, '').trim();
+	if (after.startsWith('tag:')) {
+		const tag = after.slice(4).trim();
+		const url = `https://public.api.bsky.app/xrpc/app.bsky.feed.searchPosts?q=${encodeURIComponent('#' + tag)}&limit=25`;
+		const r = await fetch(url, { headers: { 'User-Agent': USER_AGENT } });
+		if (!r.ok) throw new Error(`bluesky → ${r.status}`);
+		const d = await r.json();
+		return (d.posts ?? []).map((p) => ({
+			id: p.uri.split('/').pop() ?? p.cid,
+			title: (p.record?.text ?? '').slice(0, 280),
+			selftext: p.record?.text ?? '',
+			author: p.author?.handle ?? '',
+			permalink: `https://bsky.app/profile/${p.author?.handle}/post/${p.uri.split('/').pop()}`,
+			subreddit: `bsky:tag:${tag}`,
+			score: p.likeCount ?? 0,
+			num_comments: p.replyCount ?? 0,
+			created_utc: Math.floor(new Date(p.record?.createdAt ?? Date.now()).getTime() / 1000),
+			url: '', thumbnail: p.author?.avatar ?? null, is_self: true, domain: 'bsky.app',
+			source: 'bluesky',
+		}));
+	}
+	const handle = after;
+	const url = `https://public.api.bsky.app/xrpc/app.bsky.feed.getAuthorFeed?actor=${encodeURIComponent(handle)}&limit=25`;
+	const r = await fetch(url, { headers: { 'User-Agent': USER_AGENT } });
+	if (!r.ok) throw new Error(`bluesky → ${r.status}`);
+	const d = await r.json();
+	return (d.feed ?? []).map((f) => {
+		const p = f.post;
+		return {
+			id: p.uri.split('/').pop() ?? p.cid,
+			title: (p.record?.text ?? '').slice(0, 280),
+			selftext: p.record?.text ?? '',
+			author: p.author?.handle ?? handle,
+			permalink: `https://bsky.app/profile/${p.author?.handle}/post/${p.uri.split('/').pop()}`,
+			subreddit: `bsky:${handle}`,
+			score: p.likeCount ?? 0,
+			num_comments: p.replyCount ?? 0,
+			created_utc: Math.floor(new Date(p.record?.createdAt ?? Date.now()).getTime() / 1000),
+			url: '', thumbnail: null, is_self: true, domain: 'bsky.app',
+			source: 'bluesky',
+		};
+	});
+}
+
+// ─── GitHub (Atom feeds — public, no auth needed for public repos) ───────
+
+async function fetchGitHub(query) {
+	// gh:owner/repo/releases | gh:owner/repo/commits | gh:owner (user activity) | gh:trending
+	const after = query.replace(/^gh:/, '').trim();
+	let url;
+	if (after === 'trending') {
+		url = 'https://github.com/trending.atom';
+	} else if (after.includes('/')) {
+		const parts = after.split('/');
+		if (parts.length === 3 && (parts[2] === 'releases' || parts[2] === 'commits' || parts[2] === 'tags')) {
+			url = `https://github.com/${parts[0]}/${parts[1]}/${parts[2]}.atom`;
+		} else if (parts.length === 2) {
+			url = `https://github.com/${parts[0]}/${parts[1]}/commits.atom`;
+		} else {
+			throw new Error('gh: format: owner/repo[/releases|commits|tags]');
+		}
+	} else {
+		url = `https://github.com/${after}.atom`;
+	}
+
+	const r = await fetch(url, { headers: { 'User-Agent': USER_AGENT, Accept: 'application/atom+xml' } });
+	if (!r.ok) throw new Error(`github → ${r.status}`);
+	const xml = await r.text();
+	const out = [];
+	const re = /<entry>([\s\S]*?)<\/entry>/g;
+	let m;
+	while ((m = re.exec(xml)) !== null && out.length < 25) {
+		const e = m[1];
+		const id = (e.match(/<id>([\s\S]*?)<\/id>/)?.[1] ?? '').trim();
+		const title = decodeEntities((e.match(/<title[^>]*>([\s\S]*?)<\/title>/)?.[1] ?? '').trim());
+		const link = e.match(/<link[^>]+href="([^"]+)"/)?.[1] ?? '';
+		const author = (e.match(/<name>([\s\S]*?)<\/name>/)?.[1] ?? '').trim();
+		const published = e.match(/<(?:published|updated)>([\s\S]*?)<\/(?:published|updated)>/)?.[1] ?? '';
+		const content = decodeEntities((e.match(/<content[^>]*>([\s\S]*?)<\/content>/)?.[1] ?? '').trim());
+		out.push({
+			id: id.split('/').pop() ?? id,
+			title, selftext: stripHtml(content),
+			author,
+			permalink: link,
+			subreddit: `gh:${after}`,
+			score: 0, num_comments: 0,
+			created_utc: published ? Math.floor(new Date(published).getTime() / 1000) : Math.floor(Date.now() / 1000),
+			url: link, thumbnail: null, is_self: false, domain: 'github.com',
+			source: 'github',
+		});
+	}
+	return out;
+}
+
+// ─── Mastodon (public Atom feed per user OR tag) ─────────────────────────
+
+async function fetchMastodon(query) {
+	// masto:user@instance | masto:tag:<tag>@instance
+	const after = query.replace(/^masto:/, '').trim();
+	let url;
+	if (after.startsWith('tag:')) {
+		const [tagPart, instance] = after.slice(4).split('@');
+		url = `https://${instance || 'mastodon.social'}/tags/${encodeURIComponent(tagPart)}.atom`;
+	} else {
+		const [user, instance] = after.split('@');
+		url = `https://${instance || 'mastodon.social'}/users/${encodeURIComponent(user)}.atom`;
+	}
+	const r = await fetch(url, { headers: { 'User-Agent': USER_AGENT, Accept: 'application/atom+xml' } });
+	if (!r.ok) throw new Error(`mastodon → ${r.status}`);
+	const xml = await r.text();
+	const out = [];
+	const re = /<entry>([\s\S]*?)<\/entry>/g;
+	let m;
+	while ((m = re.exec(xml)) !== null && out.length < 25) {
+		const e = m[1];
+		const id = (e.match(/<id>([\s\S]*?)<\/id>/)?.[1] ?? '').trim();
+		const title = decodeEntities((e.match(/<title[^>]*>([\s\S]*?)<\/title>/)?.[1] ?? '').trim());
+		const link = e.match(/<link[^>]+rel="alternate"[^>]+href="([^"]+)"/)?.[1] ?? '';
+		const author = (e.match(/<name>([\s\S]*?)<\/name>/)?.[1] ?? '').trim();
+		const published = e.match(/<published>([\s\S]*?)<\/published>/)?.[1] ?? '';
+		const content = decodeEntities((e.match(/<content[^>]*>([\s\S]*?)<\/content>/)?.[1] ?? '').trim());
+		out.push({
+			id: id.split('/').pop() ?? id,
+			title: title || stripHtml(content).slice(0, 200),
+			selftext: stripHtml(content),
+			author,
+			permalink: link,
+			subreddit: `masto:${after}`,
+			score: 0, num_comments: 0,
+			created_utc: published ? Math.floor(new Date(published).getTime() / 1000) : Math.floor(Date.now() / 1000),
+			url: link, thumbnail: null, is_self: true, domain: new URL(link || 'https://mastodon.social').hostname,
+			source: 'mastodon',
+		});
+	}
+	return out;
+}
+
 // ─── Hacker News (Algolia API — free, no auth, no IP block) ───────────────
 
 async function fetchHackerNews(query) {
@@ -224,10 +365,11 @@ async function fetchHackerNews(query) {
 }
 
 async function fetchSubreddit(subreddit) {
-	// HN source: "hn:front", "hn:show", "hn:keyword=foo", etc.
-	if (subreddit.trim().toLowerCase().startsWith('hn:')) {
-		return fetchHackerNews(subreddit);
-	}
+	const s = subreddit.trim();
+	if (s.toLowerCase().startsWith('hn:')) return fetchHackerNews(s);
+	if (s.toLowerCase().startsWith('bsky:')) return fetchBluesky(s);
+	if (s.toLowerCase().startsWith('gh:')) return fetchGitHub(s);
+	if (s.toLowerCase().startsWith('masto:')) return fetchMastodon(s);
 	// Allow comma-separated multi-sub input → Reddit's native + syntax
 	// (e.g. "news, bitcoin" → r/news+bitcoin/new.rss). Single fetch, all subs.
 	const clean = subreddit
