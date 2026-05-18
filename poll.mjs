@@ -81,6 +81,51 @@ function getTagContent(xml, tag) {
 	return m ? m[1].trim() : null;
 }
 
+/**
+ * Reddit RSS content for link posts looks like:
+ *   <table>…<a href="<external>">[link]</a> &#32; <a href="<thread>">[comments]</a></table>
+ * For self/text posts it has no [link] anchor — just the selftext HTML + [comments].
+ * We use that signal to detect is_self vs link post, and pull the external URL.
+ */
+function extractFromContent(contentRaw, threadUrl) {
+	const decoded = decodeEntities(contentRaw);
+
+	// External link: first <a href> whose text says "[link]"
+	const linkAnchor = decoded.match(/<a[^>]+href="([^"]+)"[^>]*>\s*\[link\]\s*<\/a>/i);
+	const externalUrl = linkAnchor ? linkAnchor[1] : null;
+	const isSelf = !externalUrl;
+
+	// Thumbnail: first <img src> in the content
+	const imgMatch = decoded.match(/<img[^>]+src="([^"]+)"/i);
+	const thumbnail = imgMatch ? imgMatch[1] : null;
+
+	// Domain: hostname of external link, else null (caller fills in from thread URL)
+	let domain = null;
+	if (externalUrl) {
+		try { domain = new URL(externalUrl).hostname.replace(/^www\./, ''); } catch { /* ignore */ }
+	}
+
+	// Selftext: only meaningful for self posts. Strip the "submitted by /u/x [comments]"
+	// scaffolding by isolating content between <!-- SC_OFF --> markers if present, OR
+	// by removing the standard suffix pattern.
+	let selftext = '';
+	if (isSelf) {
+		// Reddit wraps selftext in <!-- SC_OFF --><div class="md">…</div><!-- SC_ON -->
+		const scMatch = decoded.match(/<!--\s*SC_OFF\s*-->([\s\S]*?)<!--\s*SC_ON\s*-->/);
+		if (scMatch) {
+			selftext = stripHtml(scMatch[1]);
+		} else {
+			// Fallback: strip the trailing "submitted by … [comments]" boilerplate
+			selftext = stripHtml(decoded)
+				.replace(/submitted by\s+\/u\/\S+/i, '')
+				.replace(/\[(?:link|comments)\]/gi, '')
+				.trim();
+		}
+	}
+
+	return { externalUrl, isSelf, thumbnail, domain, selftext };
+}
+
 /** Parse Reddit Atom feed → array of RedditApiPost-shaped objects. */
 function parseRedditAtom(xml, fallbackSubreddit) {
 	const entries = [];
@@ -96,10 +141,8 @@ function parseRedditAtom(xml, fallbackSubreddit) {
 
 		const title = decodeEntities(getTagContent(entry, 'title') ?? '');
 
-		// content is escaped HTML containing the post body (or external link
-		// preview for link posts). Strip tags for the wire payload.
+		// content is escaped HTML containing the post body OR a link-post preview.
 		const contentRaw = getTagContent(entry, 'content') ?? '';
-		const selftext = stripHtml(contentRaw);
 
 		// <author><name>/u/username</name></author>
 		const authorRaw = getTagContent(entry, 'name') ?? '';
@@ -114,6 +157,8 @@ function parseRedditAtom(xml, fallbackSubreddit) {
 		const published = getTagContent(entry, 'published');
 		const created_utc = published ? Math.floor(new Date(published).getTime() / 1000) : Math.floor(Date.now() / 1000);
 
+		const { externalUrl, isSelf, thumbnail, domain, selftext } = extractFromContent(contentRaw, link);
+
 		entries.push({
 			id,
 			title,
@@ -122,8 +167,12 @@ function parseRedditAtom(xml, fallbackSubreddit) {
 			permalink,
 			created_utc,
 			subreddit: fallbackSubreddit,
-			// Reddit RSS doesn't expose these — pass 0 so the wire payload stays
-			// schema-compatible with the .json shape n8n nodes already consume.
+			// Worker uses these when present:
+			url: externalUrl ?? link, // external link for link posts; thread URL otherwise
+			thumbnail,
+			is_self: isSelf,
+			domain: domain ?? '', // worker re-derives from url if blank
+			// RSS doesn't expose these — let worker pass them through as 0/null.
 			score: 0,
 			num_comments: 0,
 		});
