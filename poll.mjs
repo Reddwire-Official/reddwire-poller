@@ -183,10 +183,13 @@ function parseRedditAtom(xml, fallbackSubreddit) {
 // ─── Subreddit fetcher ───────────────────────────────────────────────────
 
 async function fetchSubreddit(subreddit) {
+	// Allow comma-separated multi-sub input → Reddit's native + syntax
+	// (e.g. "news, bitcoin" → r/news+bitcoin/new.rss). Single fetch, all subs.
 	const clean = subreddit
-		.trim()
-		.replace(/^\/?r\//i, '')
-		.replace(/^\/+|\/+$/g, '');
+		.split(',')
+		.map((s) => s.trim().replace(/^\/?r\//i, '').replace(/^\/+|\/+$/g, ''))
+		.filter(Boolean)
+		.join('+');
 
 	const headers = {
 		'User-Agent': USER_AGENT,
