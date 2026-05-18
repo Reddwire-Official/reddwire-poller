@@ -182,7 +182,52 @@ function parseRedditAtom(xml, fallbackSubreddit) {
 
 // ─── Subreddit fetcher ───────────────────────────────────────────────────
 
+// ─── Hacker News (Algolia API — free, no auth, no IP block) ───────────────
+
+async function fetchHackerNews(query) {
+	// Query syntax: "hn:front" | "hn:new" | "hn:show" | "hn:ask" | "hn:keyword"
+	const after = query.replace(/^hn:/, '').trim();
+	const url = after === 'front' || !after
+		? 'https://hn.algolia.com/api/v1/search?tags=front_page&hitsPerPage=25'
+		: after === 'new'
+		? 'https://hn.algolia.com/api/v1/search_by_date?tags=story&hitsPerPage=25'
+		: after === 'show'
+		? 'https://hn.algolia.com/api/v1/search_by_date?tags=show_hn&hitsPerPage=25'
+		: after === 'ask'
+		? 'https://hn.algolia.com/api/v1/search_by_date?tags=ask_hn&hitsPerPage=25'
+		: `https://hn.algolia.com/api/v1/search_by_date?query=${encodeURIComponent(after)}&tags=story&hitsPerPage=25`;
+
+	const r = await fetch(url, { headers: { 'User-Agent': USER_AGENT } });
+	if (!r.ok) throw new Error(`hn.algolia → ${r.status}`);
+	const data = await r.json();
+	return (data.hits ?? []).map((h) => {
+		const externalUrl = h.url || `https://news.ycombinator.com/item?id=${h.objectID}`;
+		let domain = '';
+		try { domain = new URL(externalUrl).hostname.replace(/^www\./, ''); } catch {}
+		return {
+			id: String(h.objectID),
+			title: h.title ?? '',
+			selftext: h.story_text ? h.story_text.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() : '',
+			author: h.author ?? '',
+			permalink: `https://news.ycombinator.com/item?id=${h.objectID}`,
+			subreddit: 'hackernews',
+			score: h.points ?? 0,
+			num_comments: h.num_comments ?? 0,
+			created_utc: h.created_at_i ?? Math.floor(Date.now() / 1000),
+			url: externalUrl,
+			thumbnail: null,
+			is_self: !h.url,
+			domain,
+			source: 'hackernews',
+		};
+	});
+}
+
 async function fetchSubreddit(subreddit) {
+	// HN source: "hn:front", "hn:show", "hn:keyword=foo", etc.
+	if (subreddit.trim().toLowerCase().startsWith('hn:')) {
+		return fetchHackerNews(subreddit);
+	}
 	// Allow comma-separated multi-sub input → Reddit's native + syntax
 	// (e.g. "news, bitcoin" → r/news+bitcoin/new.rss). Single fetch, all subs.
 	const clean = subreddit
